@@ -54,7 +54,12 @@ execute_lgtv_command() {
     dialog --infobox "Executing command..." 3 30
 
     # Execute the command and capture output
-    lgtv --ssl $command $args > "$output_file" 2>&1
+    if [ "$command" = "startApp" ]; then
+        # For startApp, always pass the app ID directly without quotes
+        lgtv --ssl startApp $args > "$output_file" 2>&1
+    else
+        lgtv --ssl "$command" "$args" > "$output_file" 2>&1
+    fi
     local exit_code=$?
 
     # Read the output
@@ -66,7 +71,12 @@ execute_lgtv_command() {
     # Check if the command was successful
     if [ $exit_code -eq 0 ]; then
         # Always show the command and its output
-        local display_text="Command: lgtv --ssl $command $args\n\nOutput:\n$output"
+        local display_text
+        if [ "$command" = "startApp" ]; then
+            display_text="Command: lgtv --ssl startApp $args\n\nOutput:\n$output"
+        else
+            display_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nOutput:\n$output"
+        fi
 
         # Display the command and its output
         dialog --title "Command Output" --msgbox "$display_text" 20 70
@@ -74,13 +84,31 @@ execute_lgtv_command() {
         # Check for specific error patterns
         if [[ "$output" == *"Connection reset by peer"* ]]; then
             # Connection error - TV might be off or unreachable
-            dialog --title "Connection Error" --msgbox "Command: lgtv --ssl $command $args\n\nFailed to connect to the TV. The TV might be turned off, disconnected from the network, or unreachable.\n\nError details:\n$output" 15 70
+            local error_text
+            if [ "$command" = "startApp" ]; then
+                error_text="Command: lgtv --ssl startApp $args\n\nFailed to connect to the TV. The TV might be turned off, disconnected from the network, or unreachable.\n\nError details:\n$output"
+            else
+                error_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nFailed to connect to the TV. The TV might be turned off, disconnected from the network, or unreachable.\n\nError details:\n$output"
+            fi
+            dialog --title "Connection Error" --msgbox "$error_text" 15 70
         elif [[ "$output" == *"Invalid numeric literal"* || "$output" == *"parse error"* ]]; then
             # JSON parsing error
-            dialog --title "Parse Error" --msgbox "Command: lgtv --ssl $command $args\n\nReceived invalid response from TV. The TV might be unreachable or the response format has changed.\n\nError details:\n$output" 15 70
+            local error_text
+            if [ "$command" = "startApp" ]; then
+                error_text="Command: lgtv --ssl startApp $args\n\nReceived invalid response from TV. The TV might be unreachable or the response format has changed.\n\nError details:\n$output"
+            else
+                error_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nReceived invalid response from TV. The TV might be unreachable or the response format has changed.\n\nError details:\n$output"
+            fi
+            dialog --title "Parse Error" --msgbox "$error_text" 15 70
         else
             # Generic error message
-            dialog --title "Error" --msgbox "Command: lgtv --ssl $command $args\n\nFailed with error:\n$output" 15 70
+            local error_text
+            if [ "$command" = "startApp" ]; then
+                error_text="Command: lgtv --ssl startApp $args\n\nFailed with error:\n$output"
+            else
+                error_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nFailed with error:\n$output"
+            fi
+            dialog --title "Error" --msgbox "$error_text" 15 70
         fi
     fi
 }
@@ -370,8 +398,8 @@ start_app() {
     if [ -s /tmp/lg_apps.json ]; then
         # Check if the file contains valid JSON
         if head -1 /tmp/lg_apps.json | jq . &>/dev/null; then
-            head -1 /tmp/lg_apps.json | jq -r '.payload.apps[] | "\(.title) \(.id)"' 2>/dev/null | sort | \
-            while read -r title id; do
+            head -1 /tmp/lg_apps.json | jq -r '.payload.apps[] | "\(.title)|\(.id)"' 2>/dev/null | sort | \
+            while IFS='|' read -r title id; do
                 echo "\"$title\" \"$id\"" >> /tmp/lg_apps_menu.txt
             done
         else
@@ -415,6 +443,7 @@ start_app() {
         done < /tmp/lg_apps_menu.txt
 
         # Start the selected app using the execute_lgtv_command function
+        # Use app_id directly for all apps
         execute_lgtv_command "startApp" "$app_id" "App started: $app_id (${selected_app_name})"
     fi
 
