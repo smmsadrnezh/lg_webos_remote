@@ -57,6 +57,9 @@ execute_lgtv_command() {
     if [ "$command" = "startApp" ]; then
         # For startApp, always pass the app ID directly without quotes
         lgtv --ssl startApp $args > "$output_file" 2>&1
+    elif [ -z "$args" ]; then
+        # For commands that don't need arguments, don't pass an empty argument
+        lgtv --ssl "$command" > "$output_file" 2>&1
     else
         lgtv --ssl "$command" "$args" > "$output_file" 2>&1
     fi
@@ -74,6 +77,8 @@ execute_lgtv_command() {
         local display_text
         if [ "$command" = "startApp" ]; then
             display_text="Command: lgtv --ssl startApp $args\n\nOutput:\n$output"
+        elif [ -z "$args" ]; then
+            display_text="Command: lgtv --ssl \"$command\"\n\nOutput:\n$output"
         else
             display_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nOutput:\n$output"
         fi
@@ -87,6 +92,8 @@ execute_lgtv_command() {
             local error_text
             if [ "$command" = "startApp" ]; then
                 error_text="Command: lgtv --ssl startApp $args\n\nFailed to connect to the TV. The TV might be turned off, disconnected from the network, or unreachable.\n\nError details:\n$output"
+            elif [ -z "$args" ]; then
+                error_text="Command: lgtv --ssl \"$command\"\n\nFailed to connect to the TV. The TV might be turned off, disconnected from the network, or unreachable.\n\nError details:\n$output"
             else
                 error_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nFailed to connect to the TV. The TV might be turned off, disconnected from the network, or unreachable.\n\nError details:\n$output"
             fi
@@ -96,6 +103,8 @@ execute_lgtv_command() {
             local error_text
             if [ "$command" = "startApp" ]; then
                 error_text="Command: lgtv --ssl startApp $args\n\nReceived invalid response from TV. The TV might be unreachable or the response format has changed.\n\nError details:\n$output"
+            elif [ -z "$args" ]; then
+                error_text="Command: lgtv --ssl \"$command\"\n\nReceived invalid response from TV. The TV might be unreachable or the response format has changed.\n\nError details:\n$output"
             else
                 error_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nReceived invalid response from TV. The TV might be unreachable or the response format has changed.\n\nError details:\n$output"
             fi
@@ -105,6 +114,8 @@ execute_lgtv_command() {
             local error_text
             if [ "$command" = "startApp" ]; then
                 error_text="Command: lgtv --ssl startApp $args\n\nFailed with error:\n$output"
+            elif [ -z "$args" ]; then
+                error_text="Command: lgtv --ssl \"$command\"\n\nFailed with error:\n$output"
             else
                 error_text="Command: lgtv --ssl \"$command\" \"$args\"\n\nFailed with error:\n$output"
             fi
