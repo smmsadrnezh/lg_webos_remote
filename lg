@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""lg: a remote control for LG webOS TVs, in the terminal.
+
+Usage:
+  lg                     open the menu
+  lg setup [IP]          find the TV on the network (or use IP) and pair with it
+  lg on | off            turn the TV on (Wake-on-LAN) or off
+  lg screen-on | screen-off
+  lg volume [N|up|down]  show the volume, or change it
+  lg mute | unmute
+  lg play | pause | stop | rewind | forward
+  lg input [ID]          list the inputs, or switch to one
+  lg app [ID]            list the apps, or start one
+  lg open URL            open a web page (YouTube links open in the YouTube app)
+  lg notify TEXT         show a message on the TV
+
+lg needs only Python 3, plus whiptail or dialog for the menu. It talks to the
+TV through the TV's own websocket API and keeps the pairing in
+~/.config/lg/config.json.
+"""
+
+import base64
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from urllib.parse import unquote, urlparse
+
+PORT = 3001         # the TV's websocket API (TLS)
+TIMEOUT = 10        # seconds to wait for the TV to answer
+PAIR_TIMEOUT = 120  # seconds to wait for the pairing request to be accepted
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                      "lg", "config.json")
+TITLE = "LG TV Remote Control"
+
+# What lg asks the TV to allow when pairing. Most open-source clients send
+# these in a manifest signed with an old LG test certificate, which recent LG
+# firmware rejects ("403 Pairing rejected: blacklisted certificate detected").
+# Sent unsigned, the TV still shows the pairing prompt and grants them, as long
+# as each one is listed here (READ_INSTALLED_APPS is the one that lists apps).
+PERMISSIONS = """
+    READ_INSTALLED_APPS
+    LAUNCH LAUNCH_WEBAPP APP_TO_APP CLOSE TEST_OPEN TEST_PROTECTED CONTROL_AUDIO
+    CONTROL_DISPLAY CONTROL_INPUT_JOYSTICK CONTROL_INPUT_MEDIA_RECORDING
+    CONTROL_INPUT_MEDIA_PLAYBACK CONTROL_INPUT_TV CONTROL_POWER READ_APP_STATUS
+    READ_CURRENT_CHANNEL READ_INPUT_DEVICE_LIST READ_NETWORK_STATE READ_RUNNING_APPS
+    READ_TV_CHANNEL_LIST WRITE_NOTIFICATION_TOAST READ_POWER_STATE READ_COUNTRY_INFO
+    READ_SETTINGS CONTROL_TV_SCREEN CONTROL_TV_STANBY CONTROL_FAVORITE_GROUP
+    CONTROL_USER_INFO CHECK_BLUETOOTH_DEVICE CONTROL_BLUETOOTH CONTROL_TIMER_INFO
+    STB_INTERNAL_CONNECTION CONTROL_RECORDING READ_RECORDING_STATE WRITE_RECORDING_LIST
+    READ_RECORDING_LIST READ_RECORDING_SCHEDULE WRITE_RECORDING_SCHEDULE
+    READ_STORAGE_DEVICE_LIST READ_TV_PROGRAM_INFO CONTROL_BOX_CHANNEL
+    READ_TV_ACR_AUTH_TOKEN READ_TV_CONTENT_STATE READ_TV_CURRENT_TIME
+    ADD_LAUNCHER_CHANNEL SET_CHANNEL_SKIP RELEASE_CHANNEL_SKIP CONTROL_CHANNEL_BLOCK
+    DELETE_SELECT_CHANNEL CONTROL_CHANNEL_GROUP SCAN_TV_CHANNELS CONTROL_TV_POWER
+    CONTROL_WOL
+""".split()
+
+# Commands that are a single request: command -> (uri, payload, what to say).
+SIMPLE = {
+    "off": ("system/turnOff", None, "The TV is turning off."),
+    "screen-off": ("com.webos.service.tvpower/power/turnOffScreen",
+                   {"standbyMode": "active"}, "Screen turned off."),
+    "screen-on": ("com.webos.service.tvpower/power/turnOnScreen",
+                  {"standbyMode": "active"}, "Screen turned on."),
+    "mute": ("audio/setMute", {"mute": True}, "Sound muted."),
+    "unmute": ("audio/setMute", {"mute": False}, "Sound unmuted."),
+    "play": ("media.controls/play", None, "Playing."),
+    "pause": ("media.controls/pause", None, "Paused."),
+    "stop": ("media.controls/stop", None, "Stopped."),
+    "rewind": ("media.controls/rewind", None, "Rewinding."),
+    "forward": ("media.controls/fastForward", None, "Fast-forwarding."),
+}
+COMMANDS = set(SIMPLE) | {"on", "volume", "input", "app", "open", "notify"}
+
+
+class LgError(Exception):
+    """A problem to tell the user about, without a traceback."""
+
+
+# ------------------------------- the TV's API ------------------------------ #
+
+class TV:
+    """A connection to the TV's websocket API (SSAP), paired on connecting.
+
+    Python has no websocket client built in; the little lg needs of one
+    (text messages, client side, no extensions) is written out here.
+    """
+
+    def __init__(self, ip, key=None):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE  # the TV's certificate is self-signed
+        try:
+            raw = socket.create_connection((ip, PORT), timeout=TIMEOUT)
+            self.sock = context.wrap_socket(raw, server_hostname=ip)
+        except OSError as e:
+            raise LgError(f"cannot reach the TV at {ip} ({e.strerror or e}). "
+                          "Is it plugged in and on this network?") from None
+        self.file = self.sock.makefile("rb")
+        self.count = 0
+        self.key = None
+        self.prompted = False
+        try:
+            self._upgrade(ip)
+            self.key = self._register(key)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        try:
+            self._send_frame(0x8, b"\x03\xe8")  # close, "normal closure"
+            self.sock.close()
+        except OSError:
+            pass
+
+    def request(self, uri, payload=None):
+        """Call ssap://URI on the TV and return the reply's payload."""
+        self.count += 1
+        message = {"type": "request", "id": str(self.count), "uri": "ssap://" + uri}
+        if payload is not None:
+            message["payload"] = payload
+        self._send(message)
+        while True:
+            reply = self._receive()
+            if reply.get("id") != message["id"]:
+                continue
+            result = reply.get("payload") or {}
+            if reply.get("type") == "error" or result.get("returnValue") is False:
+                raise LgError("the TV refused: " + (result.get("errorText")
+                                                    or reply.get("error") or "no reason given"))
+            return result
+
+    def _upgrade(self, ip):
+        nonce = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET / HTTP/1.1\r\nHost: {ip}:{PORT}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {nonce}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                           ).encode())
+        status = self.file.readline().decode(errors="replace").strip()
+        while self.file.readline() not in (b"\r\n", b""):
+            pass
+        if " 101 " not in status + " ":
+            raise LgError(f"the TV did not accept the connection ({status or 'no answer'})")
+
+    def _register(self, key):
+        payload = {"forcePairing": False, "pairingType": "PROMPT",
+                   "manifest": {"manifestVersion": 1, "appVersion": "1.1",
+                                "permissions": PERMISSIONS}}
+        if key:
+            payload["client-key"] = key
+        self._send({"type": "register", "id": "register", "payload": payload})
+        while True:
+            reply = self._receive()
+            if reply.get("type") == "registered":
+                self.sock.settimeout(TIMEOUT)
+                return reply["payload"]["client-key"]
+            if reply.get("type") == "error":
+                raise LgError(f"the TV refused to pair: {reply.get('error')}")
+            if (reply.get("payload") or {}).get("pairingType") == "PROMPT":
+                print("Accept the pairing request on the TV with its remote control...",
+                      file=sys.stderr, flush=True)
+                self.prompted = True
+                self.sock.settimeout(PAIR_TIMEOUT)
+
+    def _closed(self):
+        """The error for the TV hanging up, which before pairing has a likely cause."""
+        if self.key:
+            return LgError("the TV closed the connection")
+        if self.prompted:
+            return LgError("the pairing request was declined on the TV")
+        # In standby the TV still accepts connections, then hangs up.
+        return LgError('the TV is off or still starting up. Turn it on with "lg on".')
+
+    def _send(self, message):
+        self._send_frame(0x1, json.dumps(message).encode())
+
+    def _send_frame(self, opcode, data):
+        size = len(data)
+        if size < 126:
+            header = bytes([0x80 | opcode, 0x80 | size])
+        elif size < 1 << 16:
+            header = bytes([0x80 | opcode, 0x80 | 126]) + size.to_bytes(2, "big")
+        else:
+            header = bytes([0x80 | opcode, 0x80 | 127]) + size.to_bytes(8, "big")
+        mask = os.urandom(4)  # clients must mask what they send
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _receive(self):
+        """Read the next message from the TV as JSON."""
+        message = b""
+        while True:
+            first, second = self._read(2)
+            opcode, size = first & 0x0F, second & 0x7F
+            if size >= 126:
+                size = int.from_bytes(self._read(2 if size == 126 else 8), "big")
+            mask = self._read(4) if second & 0x80 else b""
+            data = self._read(size)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                raise self._closed()
+            if opcode == 0x9:
+                self._send_frame(0xA, data)  # answer a ping
+            elif opcode in (0x0, 0x1):
+                message += data
+                if first & 0x80:
+                    return json.loads(message)
+
+    def _read(self, size):
+        try:
+            data = self.file.read(size)
+        except TimeoutError:
+            raise LgError("the TV stopped answering") from None
+        except OSError as e:
+            raise LgError(f"lost the connection to the TV ({e.strerror or e})") from None
+        if len(data) < size:
+            raise self._closed()
+        return data
+
+
+def list_inputs(tv):
+    devices = tv.request("tv/getExternalInputList").get("devices", [])
+    return [(d["id"], d.get("label") or d["id"]) for d in devices]
+
+
+def list_apps(tv):
+    apps = tv.request("com.webos.applicationManager/listApps").get("apps", [])
+    apps = [(a["id"], a.get("title") or a["id"]) for a in apps if a.get("visible", True)]
+    return sorted(apps, key=lambda app: app[1].lower())
+
+
+LISTS = {"input": list_inputs, "app": list_apps}
+
+
+def is_youtube(url):
+    host = urlparse(url).hostname or ""
+    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+
+
+# --------------------------- config and network ---------------------------- #
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise LgError(f"cannot read {CONFIG}: {e}") from None
+
+
+def save_config(config):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    # The pairing key lets anyone on the network control the TV: keep it private.
+    with os.fdopen(os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def connect(config):
+    if not config.get("ip"):
+        raise LgError('no TV is set up yet: run "lg setup"')
+    tv = TV(config["ip"], config.get("key"))
+    if tv.key != config.get("key"):  # paired again: remember the new key
+        config["key"] = tv.key
+        save_config(config)
+    return tv
+
+
+def wake(ip, mac):
+    """Send a Wake-on-LAN packet, which turns on a TV that is in standby."""
+    if not mac:
+        raise LgError("the TV's hardware (MAC) address is unknown, so it cannot be "
+                      'turned on remotely. Run "lg setup" while the TV is on.')
+    packet = b"\xff" * 6 + bytes.fromhex(mac.replace(":", "")) * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Everyone on this link, and the TV's /24 network for good measure.
+        for target in ("255.255.255.255", ip.rsplit(".", 1)[0] + ".255"):
+            try:
+                s.sendto(packet, (target, 9))
+            except OSError:
+                pass
+
+
+def neighbours():
+    """IP and hardware address of the hosts this computer has talked to lately."""
+    try:
+        with open("/proc/net/arp") as f:
+            rows = [line.split() for line in f.readlines()[1:]]
+    except OSError:
+        return {}
+    return {row[0]: row[3] for row in rows if len(row) > 3 and row[3] != "00:00:00:00:00:00"}
+
+
+def port_open(ip):
+    try:
+        socket.create_connection((ip, PORT), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def discover():
+    """LG TVs on the local network, as {ip: (name, awake)}."""
+    found = {}
+    query = ('M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\n'
+             "MX: 2\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n").encode()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(0.5)
+        s.sendto(query, ("239.255.255.250", 1900))
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                reply, (ip, _) = s.recvfrom(4096)
+            except TimeoutError:
+                continue
+            if b"LG" in reply:
+                name = re.search(rb"DLNADeviceName\.lge\.com:(.*)", reply)
+                found[ip] = (unquote(name.group(1).decode(errors="replace").strip())
+                             if name else "LG TV", True)
+    # A TV in standby does not answer the search but keeps its API port open.
+    for ip in neighbours():
+        if ip not in found and port_open(ip):
+            found[ip] = ("LG TV, in standby", False)
+    return found
+
+
+def pair(config, ip, asleep=False):
+    """Pair with the TV at IP and make it the TV lg controls."""
+    same_tv = config.get("ip") == ip
+    mac = neighbours().get(ip) or (config.get("mac") if same_tv else None)
+    if asleep and mac:  # the pairing prompt needs the screen on
+        wake(ip, mac)
+        time.sleep(5)
+    with TV(ip, config.get("key") if same_tv else None) as tv:
+        config.update(ip=ip, mac=neighbours().get(ip) or mac, key=tv.key)
+    save_config(config)
+    return f"Paired with the TV at {ip}."
+
+
+# ------------------------------ the commands ------------------------------- #
+
+def execute(config, command, arg=""):
+    """Run one of the commands in the usage above; returns what to tell the user."""
+    if command not in COMMANDS:
+        raise LgError(f'unknown command "{command}" (see "lg help")')
+    if command in ("open", "notify") and not arg:
+        raise LgError(f"{command} needs {'an address' if command == 'open' else 'a message'}")
+    if command == "volume" and arg not in ("", "up", "down") and not (
+            arg.isdigit() and int(arg) <= 100):
+        raise LgError("the volume is a number from 0 to 100, up or down")
+    if command == "on":
+        wake(config.get("ip", ""), config.get("mac"))
+        return "Sent the wake-up signal. The TV should turn on in a few seconds."
+
+    with connect(config) as tv:
+        if command in SIMPLE:
+            uri, payload, done = SIMPLE[command]
+            tv.request(uri, payload)
+            return done
+        if command in LISTS and not arg:
+            return "\n".join(f"{id:<32} {name}" for id, name in LISTS[command](tv))
+        if command == "volume":
+            if arg in ("up", "down"):
+                tv.request("audio/volume" + arg.capitalize())
+            elif arg:
+                tv.request("audio/setVolume", {"volume": int(arg)})
+            status = tv.request("audio/getVolume")
+            status = status.get("volumeStatus", status)  # its shape varies by webOS version
+            muted = status.get("muteStatus", status.get("muted"))
+            return f"Volume {status.get('volume')}{', muted' if muted else ''}."
+        if command == "input":
+            tv.request("tv/switchInput", {"inputId": arg})
+            return f"Switched to {arg}."
+        if command == "app":
+            tv.request("system.launcher/launch", {"id": arg})
+            return f"Started {arg}."
+        if command == "open":
+            url = arg if "://" in arg else "https://" + arg
+            if is_youtube(url):
+                tv.request("system.launcher/launch",
+                           {"id": "youtube.leanback.v4", "params": {"contentTarget": url}})
+                return "Opened in the YouTube app."
+            tv.request("system.launcher/open", {"target": url})
+            return "Opened in the TV's web browser."
+        if command == "notify":
+            tv.request("system.notifications/createToast", {"message": arg})
+            return "Message shown on the TV."
+
+
+def setup_command(config, args):
+    if args:
+        ip, asleep = args[0], False
+    else:
+        print("Looking for LG TVs on the network...", file=sys.stderr)
+        tvs = discover()
+        if len(tvs) != 1:
+            listing = "".join(f"\n  {ip}  {name}" for ip, (name, _) in tvs.items())
+            raise LgError("found more than one TV; run \"lg setup IP\" with one of:" + listing
+                          if tvs else "found no TV. Turn it on, or run \"lg setup IP\"")
+        [(ip, (name, awake))] = tvs.items()
+        asleep = not awake
+        print(f"Found {name} at {ip}.", file=sys.stderr)
+    return pair(config, ip, asleep)
+
+
+# -------------------------------- the menu --------------------------------- #
+
+class UI:
+    """Boxes drawn by whiptail or dialog, which take nearly the same options."""
+
+    def __init__(self, tool):
+        self.tool = tool
+
+    def _show(self, *args):
+        """Show a box; returns the user's answer, or None if they cancelled."""
+        common = ["--backtitle", TITLE]
+        if self.tool == "dialog":
+            common.append("--cr-wrap")  # keep the line breaks in our texts
+        result = subprocess.run([self.tool, *common, *args], stderr=subprocess.PIPE, text=True)
+        return result.stderr.strip() if result.returncode == 0 else None
+
+    def _size(self):
+        size = shutil.get_terminal_size()
+        return size.lines, min(76, size.columns - 2)
+
+    def menu(self, title, prompt, items, default=None):
+        rows, width = self._size()
+        extra = prompt.count("\n")
+        height = max(1, min(len(items), rows - 9 - extra))
+        options = ["--title", title] + (["--default-item", default] if default else [])
+        return self._show(*options, "--menu", prompt, str(height + 8 + extra), str(width),
+                          str(height), *[part for item in items for part in item])
+
+    def ask(self, title, prompt):
+        return self._show("--title", title, "--inputbox", prompt, "10", str(self._size()[1]), "")
+
+    def tell(self, title, text):
+        rows, width = self._size()
+        lines = sum(len(line) // (width - 4) + 1 for line in text.split("\n"))
+        scroll = ["--scrolltext"] if self.tool == "whiptail" else []
+        self._show("--title", title, *scroll, "--msgbox", text,
+                   str(min(rows - 2, lines + 7)), str(width))
+
+    def confirm(self, title, text):
+        return self._show("--title", title, "--yesno", text, "10", str(self._size()[1])) is not None
+
+
+POWER = [("on", "Turn the TV on"), ("off", "Turn the TV off"),
+         ("screen-on", "Turn the screen on"),
+         ("screen-off", "Turn the screen off (the sound keeps playing)")]
+VOLUME = [("up", "Volume up"), ("down", "Volume down"), ("set", "Set the volume..."),
+          ("mute", "Mute"), ("unmute", "Unmute")]
+MEDIA = [("play", "Play"), ("pause", "Pause"), ("stop", "Stop"),
+         ("rewind", "Rewind"), ("forward", "Fast forward")]
+
+
+def interactive(config):
+    tool = os.environ.get("LG_UI") or next(
+        (t for t in ("whiptail", "dialog") if shutil.which(t)), None)
+    if not tool:
+        raise LgError("the menu needs whiptail or dialog: sudo apt install whiptail")
+    ui = UI(tool)
+
+    def attempt(action):
+        """Run an action that talks to the TV; show what went wrong, if anything."""
+        print("Talking to the TV...", file=sys.stderr, flush=True)
+        try:
+            return action()
+        except LgError as e:
+            ui.tell("Error", str(e)[:1].upper() + str(e)[1:])
+            return None
+
+    def submenu(title, items):
+        note, choice = None, None
+        while True:
+            prompt = (note + "\n\n" if note else "") + "Choose an action:"
+            choice = ui.menu(title, prompt, items, choice)
+            if choice is None:
+                return None
+            if choice == "set":
+                level = ui.ask("Set Volume", "Volume level, from 0 to 100:")
+                if not level:
+                    continue
+                command, arg = "volume", level
+            elif choice in ("up", "down"):
+                command, arg = "volume", choice
+            else:
+                command, arg = choice, ""
+            note = attempt(lambda: execute(config, command, arg)) or note
+
+    def choose(kind, title):
+        def fetch():
+            with connect(config) as tv:
+                return LISTS[kind](tv)
+        found = attempt(fetch)
+        if not found:
+            if found is not None:
+                ui.tell(title, f"The TV did not list any {kind}s.")
+            return None
+        if kind == "app":  # list app names; the ids are long and mean little
+            ids = {name: id for id, name in reversed(found)}
+            found = [(name, id) for id, name in found]
+        choice = ui.menu(title, f"Choose an {kind}:", found)
+        if choice is None:
+            return None
+        target = ids[choice] if kind == "app" else choice
+        return attempt(lambda: execute(config, kind, target))
+
+    def type_in(command, title, prompt):
+        text = ui.ask(title, prompt)
+        return attempt(lambda: execute(config, command, text)) if text else None
+
+    def setup():
+        print("Looking for LG TVs on the network...", file=sys.stderr, flush=True)
+        tvs = discover()
+        items = [(ip, name) for ip, (name, _) in tvs.items()]
+        items.append(("other", "Enter the TV's IP address"))
+        prompt = ("Choose your TV:" if tvs else
+                  "No TV answered. Turn the TV on and try again, or enter its IP address.")
+        ip = ui.menu("Set Up TV", prompt, items)
+        if ip == "other":
+            ip = ui.ask("Set Up TV", "The TV's IP address (in the TV's network settings):")
+        if not ip:
+            return None
+        asleep = ip in tvs and not tvs[ip][1]
+        print(f"Pairing with the TV at {ip}...", file=sys.stderr, flush=True)
+        return attempt(lambda: pair(config, ip, asleep))
+
+    actions = {
+        "1": ("Power", lambda: submenu("Power", POWER)),
+        "2": ("Volume", lambda: submenu("Volume", VOLUME)),
+        "3": ("Media", lambda: submenu("Media", MEDIA)),
+        "4": ("Inputs", lambda: choose("input", "Inputs")),
+        "5": ("Apps", lambda: choose("app", "Apps")),
+        "6": ("Open URL", lambda: type_in(
+            "open", "Open URL", "Address to open (YouTube links open in the YouTube app):")),
+        "7": ("Send Message", lambda: type_in(
+            "notify", "Send Message", "Message to show on the TV:")),
+        "8": ("Set Up TV", setup),
+    }
+
+    if not config.get("ip") and ui.confirm(
+            "Set Up TV", "No TV is set up yet.\n\nFind your LG TV on the network and pair "
+                         "with it now? Keep the TV on and its remote at hand."):
+        setup()
+    note, choice = None, None
+    while True:
+        prompt = (note + "\n\n" if note else "") + "Choose what to do:"
+        choice = ui.menu(TITLE, prompt, [(key, name) for key, (name, _) in actions.items()],
+                         choice)
+        if choice is None:
+            return
+        note = actions[choice][1]()
+
+
+def main(args):
+    try:
+        config = load_config()
+        if not args:
+            interactive(config)
+        elif args[0] in ("help", "-h", "--help"):
+            print(__doc__.strip())
+        elif args[0] == "setup":
+            print(setup_command(config, args[1:]))
+        else:
+            print(execute(config, args[0], " ".join(args[1:])))
+    except LgError as e:
+        print(f"lg: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,122 +1,120 @@
 # LG TV Remote Control
 
-A bash script that provides a user-friendly terminal interface to control LG WebOS TVs. This script uses dialog boxes to present menus and options, making it easy to control your LG TV from your computer.
+`lg` controls an LG webOS TV from the terminal, through a menu or one-line
+commands. It is a single Python file that uses only the standard library and
+talks to the TV directly. Nothing else needs to be installed.
 
 ## Features
 
-- Power controls (turn TV on/off, screen on/off)
-- Volume controls (up, down, set specific level)
-- Media controls (play, pause, rewind)
-- Input selection (HDMI, etc.)
-- Open URLs (including special handling for YouTube)
-- Launch apps installed on the TV
-- Send notifications to the TV
+- Power: turn the TV on (Wake-on-LAN) or off, and turn the screen on or off
+- Volume: up, down, set a level, mute and unmute
+- Media: play, pause, stop, rewind, fast forward
+- Inputs: list them and switch between them (HDMI, etc.)
+- Apps: list the installed apps and start one
+- Open a URL in the TV's browser (YouTube links open in the YouTube app)
+- Show a message on the TV
+- Find the TV on the network and pair with it
 
-## Prerequisites
+## Requirements
 
-The script requires the following dependencies:
-
-- `lgtv` - A command-line tool for controlling LG WebOS TVs
-- `dialog` - A utility for creating TUI dialog boxes
-- `jq` - A lightweight and flexible command-line JSON processor
+- Python 3 (part of every Ubuntu install)
+- `whiptail` or `dialog` for the menu (`whiptail` is part of every Ubuntu
+  install). The one-line commands do not need either.
+- The TV and the computer on the same network
+- For `lg on`, the TV's *Turn on via Wi-Fi* (or *Mobile TV On*) setting
+  must be on
 
 ## Installation
 
-1. Clone or download this repository to your local machine.
-
-2. Make the script executable:
-   ```bash
-   chmod +x lg
-   ```
-
-3. Install the required dependencies:
-
-   - Install `lgtv` using pipx:
-     ```bash
-     pipx install git+https://github.com/klattimer/LGWebOSRemote.git
-     ```
-     
-   - Install `dialog` and `jq` using your package manager:
-     ```bash
-     # For Debian/Ubuntu
-     sudo apt-get install dialog jq
-     
-     # For Fedora
-     sudo dnf install dialog jq
-     
-     # For Arch Linux
-     sudo pacman -S dialog jq
-     ```
+```bash
+git clone https://github.com/smmsadrnezh/lg_webos_remote.git
+install -m 755 lg_webos_remote/lg ~/.local/bin/lg
+```
 
 ## Setup
 
-Before using the script, you need to set up the connection to your LG TV:
+Turn the TV on and run:
 
-1. Make sure your TV is turned on and connected to the same network as your computer.
+```bash
+lg setup
+```
 
-2. Scan for available TVs:
-   ```bash
-   lgtv scan
-   ```
+`lg` finds the TV on the network and asks it to pair. Accept the request on
+the TV with its remote control. If the TV is not found, give its IP address
+(you can find it in the TV's network settings):
 
-3. Authenticate with your TV (replace `[TV_IP]` with the IP address from the scan):
-   ```bash
-   lgtv --ssl auth [TV_IP] lgtv
-   ```
-   This will display a pairing request on your TV. Accept it using your TV remote.
+```bash
+lg setup 192.168.1.50
+```
 
-4. Set the default TV:
-   ```bash
-   lgtv setDefault lgtv
-   ```
+The pairing is kept in `~/.config/lg/config.json`, readable only by you. If
+no TV is set up yet, running `lg` offers to do this first.
 
 ## Usage
 
-Run the script:
-```bash
-./lg
-```
+Run `lg` with no arguments to open the menu. Use the arrow keys and Enter to
+pick an action, and Esc to go back. What each action did is shown above the
+next menu.
 
-The script will present a menu with various options:
+Or give a command:
 
-1. **Power Controls** - Turn the TV on/off or control the screen power
-2. **Volume Controls** - Adjust volume or set a specific level
-3. **Media Controls** - Play, pause, or rewind media
-4. **Set Input** - Select an input source (HDMI, etc.)
-5. **Open URL** - Open a URL in the TV's browser (or YouTube app for YouTube URLs)
-6. **Start App** - Launch an app installed on the TV
-7. **Send Notification** - Display a notification message on the TV
+| Command | What it does |
+| --- | --- |
+| `lg on` / `lg off` | Turn the TV on or off |
+| `lg screen-on` / `lg screen-off` | Turn the screen on or off; the sound keeps playing |
+| `lg volume` | Show the volume |
+| `lg volume 15` / `lg volume up` / `lg volume down` | Change the volume |
+| `lg mute` / `lg unmute` | Mute or unmute the sound |
+| `lg play`, `pause`, `stop`, `rewind`, `forward` | Control what is playing |
+| `lg input` | List the inputs |
+| `lg input HDMI_2` | Switch to an input |
+| `lg app` | List the apps |
+| `lg app youtube.leanback.v4` | Start an app |
+| `lg open https://example.com` | Open a page in the TV's browser |
+| `lg open https://youtu.be/...` | Play a video in the YouTube app |
+| `lg notify "Dinner is ready"` | Show a message on the TV |
+| `lg help` | List the commands |
 
-Navigate through the menus using the arrow keys and press Enter to select an option.
+To force the menu tool, set `LG_UI=dialog` or `LG_UI=whiptail`.
 
-## Examples
+## How it works
 
-### Turn the TV On/Off
-1. Select "Power Controls" from the main menu
-2. Select "TV Power"
-3. Choose "Turn TV On" or "Turn TV Off"
+The TV accepts commands on a websocket at port 3001, over TLS with a
+self-signed certificate, the same API that phone remote apps use.
+Before it obeys a client, the TV shows a pairing prompt, and it then gives the
+client a key to use from then on. `lg` writes the small websocket client it
+needs itself, so it has no dependencies. Turning the TV on is the exception:
+the API is not running then, so `lg on` sends a Wake-on-LAN packet to the
+TV's hardware address, which is saved when you pair.
 
-### Change Input Source
-1. Select "Set Input" from the main menu
-2. Choose from the list of available inputs (e.g., "HDMI 1", "HDMI 2")
-
-### Open a YouTube Video
-1. Select "Open URL" from the main menu
-2. Enter a YouTube URL (e.g., `https://www.youtube.com/watch?v=dQw4w9WgXcQ`)
-
-### Launch an App
-1. Select "Start App" from the main menu
-2. Choose from the list of installed apps
+When pairing, clients send a manifest listing the permissions they want. Most
+open-source clients sign it with an old LG test certificate, and recent LG
+firmware rejects that with `403 Pairing rejected: blacklisted certificate
+detected`. `lg` sends the manifest unsigned, which the TV accepts.
 
 ## Troubleshooting
 
-- **TV Not Found**: Make sure your TV is turned on and connected to the same network as your computer.
-- **Authentication Failed**: Try running the auth command again and make sure to accept the pairing request on your TV.
-- **Command Failed**: Check the error message displayed in the dialog box. It might indicate a connection issue or an invalid command.
-- **JSON Parsing Error**: This usually indicates that the TV is unreachable or the response format has changed.
+- **"the TV is off or still starting up"**: in standby the TV still accepts
+  connections but hangs up. Turn it on with `lg on` and wait a few seconds.
+- **`lg on` does nothing**: turn on *Turn on via Wi-Fi* (or *Mobile TV On*)
+  in the TV's settings. If `lg` says the hardware address is unknown, run
+  `lg setup` once while the TV is on.
+- **"cannot reach the TV"**: check that the TV is on the same network. If its
+  IP address changed, run `lg setup` again. Giving the TV a fixed address in
+  your router avoids this.
+- **No TV found during setup**: the search only reaches TVs that are on.
+  Turn the TV on, or run `lg setup IP`.
+- **No pairing prompt appears**: the screen must be on. Run `lg setup`
+  again while the TV is on.
 
-If you encounter persistent issues, try restarting both your TV and the script.
+## Moving from the `lgtv` version
+
+Earlier versions of this script drove the TV through `lgtv` from
+[LGWebOSRemote](https://github.com/klattimer/LGWebOSRemote), and needed
+`dialog` and `jq`. None of these are needed any more. Remove `lgtv` with
+`pipx uninstall lgtv`, then run `lg setup` once.
 
 ## License
 
-This script is provided as-is with no warranty. Feel free to modify and distribute it according to your needs.
+This script is provided as-is with no warranty. Feel free to modify and
+distribute it according to your needs.
