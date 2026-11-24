@@ -77,6 +77,7 @@ Or give a command:
 | `lg open https://example.com` | Open a page in the TV's browser |
 | `lg open https://youtu.be/...` | Play a video in the YouTube app |
 | `lg notify "Dinner is ready"` | Show a message on the TV |
+| `lg youtube "lofi beats"` | Search YouTube on the TV |
 | `lg button HOME` | Press a remote control button: `HOME`, `BACK`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `ENTER`, `MENU`, `INFO`, `EXIT`, `0` to `9`, ... |
 | `lg type "hello"` | Type into the text field selected on the TV |
 | `lg help` | List the commands |
@@ -106,6 +107,12 @@ When a text field on the TV is selected and its on-screen keyboard opens,
 scripts such as Persian go straight into the field, Backspace deletes and
 Enter submits. Tab or Esc stops typing, so the letter keys work as shortcuts
 again.
+
+YouTube is different: it draws its own on-screen keyboard, which nothing
+outside the app can type into. When YouTube is on screen, press Tab, type
+your search (it shows at the bottom of the window), and press Enter: YouTube
+opens its search with that text. `lg youtube TEXT` does the same from the
+command line.
 
 Moving the mouse over the window moves the TV's pointer: crossing the window
 crosses the TV's screen. Click to click, right-click to go back, and use the
@@ -145,9 +152,11 @@ detected`. `lg` sends the manifest unsigned, which the TV accepts.
 - **No pairing prompt appears**: the screen must be on. Run `lg setup`
   again while the TV is on.
 - **"no text field is selected on the TV"**, or typing does nothing: select
-  a text field on the TV first, so that its on-screen keyboard opens. If an
-  app draws its own keyboard instead of the TV's, typed text may not reach
-  it; use the arrow keys and Enter on that keyboard instead.
+  a text field on the TV first, so that its on-screen keyboard opens. Apps
+  that draw their own keyboard instead of the TV's, such as YouTube, cannot
+  be typed into. For YouTube, search with Tab in `lg remote` or with
+  `lg youtube TEXT`; in other such apps, use the arrow keys and Enter on the
+  app's keyboard.
 - **The mouse does nothing in `lg remote`**: the terminal must report mouse
   events. GNOME Terminal, Ptyxis, Konsole, xterm, kitty and most others do;
   inside tmux, turn on `set -g mouse on`.

@@ -14,6 +14,7 @@ Usage:
   lg app [ID]            list the apps, or start one
   lg open URL            open a web page (YouTube links open in the YouTube app)
   lg notify TEXT         show a message on the TV
+  lg youtube TEXT        search YouTube on the TV
   lg button NAME         press a remote control button: HOME, BACK, UP, ENTER, ...
   lg type TEXT           type into the text field selected on the TV
 
@@ -38,7 +39,7 @@ import sys
 import termios
 import time
 import tty
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 PORT = 3001         # the TV's websocket API (TLS)
 TIMEOUT = 10        # seconds to wait for the TV to answer
@@ -86,7 +87,9 @@ SIMPLE = {
     "rewind": ("media.controls/rewind", None, "Rewinding."),
     "forward": ("media.controls/fastForward", None, "Fast-forwarding."),
 }
-COMMANDS = set(SIMPLE) | {"on", "volume", "input", "app", "open", "notify", "button", "type"}
+COMMANDS = set(SIMPLE) | {"on", "volume", "input", "app", "open", "notify", "button", "type",
+                          "youtube"}
+YOUTUBE = "youtube.leanback.v4"  # the YouTube app's id
 
 
 class LgError(Exception):
@@ -334,6 +337,16 @@ def is_youtube(url):
     return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
 
 
+def youtube_search(query):
+    """The request that opens YouTube's search for QUERY.
+
+    The YouTube app draws its own keyboard, which the TV's text input cannot
+    reach. Starting it the way its voice search does fills in the search.
+    """
+    target = "https://www.youtube.com/tv?launch=voice&vq=" + quote(query)
+    return "system.launcher/launch", {"id": YOUTUBE, "params": {"contentTarget": target}}
+
+
 # --------------------------- config and network ---------------------------- #
 
 def load_config():
@@ -442,6 +455,7 @@ def execute(config, command, arg=""):
     if command not in COMMANDS:
         raise LgError(f'unknown command "{command}" (see "lg help")')
     needs = {"open": "an address", "notify": "a message", "type": "some text",
+             "youtube": "something to search for",
              "button": "a button name, such as HOME, BACK, UP or ENTER"}
     if command in needs and not arg:
         raise LgError(f"{command} needs {needs[command]}")
@@ -478,7 +492,7 @@ def execute(config, command, arg=""):
             url = arg if "://" in arg else "https://" + arg
             if is_youtube(url):
                 tv.request("system.launcher/launch",
-                           {"id": "youtube.leanback.v4", "params": {"contentTarget": url}})
+                           {"id": YOUTUBE, "params": {"contentTarget": url}})
                 return "Opened in the YouTube app."
             tv.request("system.launcher/open", {"target": url})
             return "Opened in the TV's web browser."
@@ -489,13 +503,20 @@ def execute(config, command, arg=""):
             with tv.pointer() as pointer:
                 pointer.button(arg.upper())
             return f"Pressed {arg.upper()}."
+        if command == "youtube":
+            tv.request(*youtube_search(arg))
+            return f"Searching YouTube for {arg}."
         if command == "type":
             # The TV only answers once a text field has taken the text.
             tv.sock.settimeout(3)
             try:
                 tv.request("com.webos.service.ime/insertText", {"text": arg, "replace": False})
             except NoAnswer:
-                raise LgError("no text field is selected on the TV") from None
+                tv.sock.settimeout(TIMEOUT)
+                app = tv.request("com.webos.applicationManager/getForegroundAppInfo").get("appId")
+                raise LgError("no text field is selected on the TV" + (
+                    '. YouTube has its own keyboard, which cannot be typed into; '
+                    'search it with "lg youtube TEXT"' if app == YOUTUBE else "")) from None
             return "Typed."
 
 
@@ -537,7 +558,8 @@ REMOTE_HELP = """
 
   Tab          type into the TV. This starts by itself when the TV's
                keyboard opens; Tab, Esc or Enter stops it. While typing,
-               Ctrl+C quits.
+               Ctrl+C quits. In YouTube, which has its own keyboard,
+               Tab starts a search: type it here and press Enter.
 
   Mouse        move it over this window to move the TV's pointer.
                Click to click, right-click to go back, scroll to scroll.
@@ -557,6 +579,9 @@ class Remote:
         self.typing = False
         self.keyboard = None   # id of the subscription to the TV's keyboard
         self.tv_typing = None  # whether the TV's keyboard is open, as it last said
+        self.apps = None       # id of the subscription to the app in front
+        self.app = None        # the app in front
+        self.search = ""       # a YouTube search being typed
         self.mouse = None      # where the mouse was in the window
         self.pixels = False    # whether the terminal reports the mouse in pixels
         self.moved = [0, 0]    # pointer movement not sent yet
@@ -565,6 +590,8 @@ class Remote:
     def run(self):
         self.keyboard = self.tv.send_request("com.webos.service.ime/registerRemoteKeyboard",
                                              kind="subscribe")
+        self.apps = self.tv.send_request("com.webos.applicationManager/getForegroundAppInfo",
+                                         kind="subscribe")
         fd = sys.stdin.fileno()
         saved = termios.tcgetattr(fd)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -617,11 +644,22 @@ class Remote:
             elif self.typing and token == "\x1b":
                 self.set_typing(False)
             elif self.typing and token in ("\x7f", "\x08"):
-                self.tv.send_request("com.webos.service.ime/deleteCharacters", {"count": 1})
-                self.show("Deleted a character.")
+                if self.searching():
+                    self.search = self.search[:-1]
+                    self.show_search()
+                else:
+                    self.tv.send_request("com.webos.service.ime/deleteCharacters", {"count": 1})
+                    self.show("Deleted a character.")
             elif self.typing and token in ("\n", "\r"):
-                self.tv.send_request("com.webos.service.ime/sendEnterKey")
-                self.set_typing(False, "Sent Enter.")
+                if self.searching():
+                    query = self.search.strip()
+                    if query:
+                        self.tv.send_request(*youtube_search(query))
+                    self.set_typing(False, f"Searching YouTube for {query}."
+                                    if query else "Stopped typing.")
+                else:
+                    self.tv.send_request("com.webos.service.ime/sendEnterKey")
+                    self.set_typing(False, "Sent Enter.")
             elif token == "q" and not self.typing:
                 return False
             elif token in KEYS:
@@ -662,12 +700,25 @@ class Remote:
             self.pointer.move(dx, dy)
             self.moved = [self.moved[0] - dx, self.moved[1] - dy]
 
+    def searching(self):
+        """Whether typing makes a YouTube search, because the text cannot go in directly."""
+        return self.typing and self.app == YOUTUBE and not self.tv_typing
+
+    def show_search(self):
+        self.show(f"YouTube search (Enter to search): {self.search}_")
+
     def type(self, text):
+        if self.searching():
+            self.search += text
+            self.show_search()
+            return
         self.tv.send_request("com.webos.service.ime/insertText", {"text": text, "replace": False})
         self.show(f"Typed: {text}")
 
     def from_tv(self, message):
-        if message.get("id") == self.keyboard:
+        if message.get("id") == self.apps:
+            self.app = (message.get("payload") or {}).get("appId") or self.app
+        elif message.get("id") == self.keyboard:
             # The TV reports on its keyboard often; follow it only when it opens
             # or closes, so that Tab and Esc can override it in between.
             widget = (message.get("payload") or {}).get("currentWidget") or {}
@@ -679,8 +730,11 @@ class Remote:
             self.show("The TV refused: " + str(message.get("error")))
 
     def set_typing(self, on, note=None):
-        self.typing = on
-        self.show(note or ("Typing into the TV." if on else "Stopped typing."))
+        self.typing, self.search = on, ""
+        if self.searching() and not note:
+            self.show_search()
+        else:
+            self.show(note or ("Typing into the TV." if on else "Stopped typing."))
 
     def window(self):
         """The terminal's size: width and height in pixels, then columns and rows."""
@@ -844,9 +898,11 @@ def interactive(config):
         "6": ("Apps", lambda: choose("app", "Apps")),
         "7": ("Open URL", lambda: type_in(
             "open", "Open URL", "Address to open (YouTube links open in the YouTube app):")),
-        "8": ("Send Message", lambda: type_in(
+        "8": ("Search YouTube", lambda: type_in(
+            "youtube", "Search YouTube", "What to search for on YouTube:")),
+        "9": ("Send Message", lambda: type_in(
             "notify", "Send Message", "Message to show on the TV:")),
-        "9": ("Set Up TV", setup),
+        "s": ("Set Up TV", setup),
     }
 
     if not config.get("ip") and ui.confirm(
