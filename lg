@@ -114,7 +114,9 @@ class WebSocket:
         except OSError as e:
             raise LgError(f"cannot reach the TV at {host} ({e.strerror or e}). "
                           "Is it plugged in and on this network?") from None
-        self.sock, self.buffer = sock, b""
+        self.sock = sock
+        self.buffer = b""     # bytes received but not read yet
+        self.fragments = b""  # the start of a message that came in several frames
         try:
             self._upgrade(f"{host}:{port}", path)
         except BaseException:
@@ -144,27 +146,39 @@ class WebSocket:
 
     def receive(self):
         """Wait for the next text message."""
-        message = b""
         while True:
-            first, second = self._read(2)
-            opcode, size = first & 0x0F, second & 0x7F
-            if size >= 126:
-                size = int.from_bytes(self._read(2 if size == 126 else 8), "big")
-            mask = self._read(4) if second & 0x80 else b""
-            data = self._read(size)
-            if mask:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-            if opcode == 0x8:
-                raise self._closed()
-            if opcode == 0x9:
-                self._send_frame(0xA, data)  # answer a ping
-            elif opcode in (0x0, 0x1):
-                message += data
-                if first & 0x80:
-                    return message.decode(errors="replace")
+            message = self.read_frame()
+            if message is not None:
+                return message
 
-    def _closed(self):
-        return LgError("the TV closed the connection")
+    def read_frame(self):
+        """Read one frame. Returns the text message it completes, if any.
+
+        The TV pings every connection now and then, and hangs up if the ping
+        is not answered within seconds; this answers it. Waiting only for text
+        here would stall a caller that has other things to do meanwhile.
+        """
+        first, second = self._read(2)
+        opcode, size = first & 0x0F, second & 0x7F
+        if size >= 126:
+            size = int.from_bytes(self._read(2 if size == 126 else 8), "big")
+        mask = self._read(4) if second & 0x80 else b""
+        data = self._read(size)
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if opcode == 0x8:
+            raise self._closed(data[2:].decode(errors="replace"))
+        if opcode == 0x9:
+            self._send_frame(0xA, data)  # answer the ping
+        elif opcode in (0x0, 0x1):
+            self.fragments += data
+            if first & 0x80:
+                message, self.fragments = self.fragments, b""
+                return message.decode(errors="replace")
+        return None
+
+    def _closed(self, reason=""):
+        return LgError("the TV closed the connection" + (f" ({reason})" if reason else ""))
 
     def _upgrade(self, host, path):
         nonce = base64.b64encode(os.urandom(16)).decode()
@@ -275,10 +289,10 @@ class TV(WebSocket):
                 self.prompted = True
                 self.sock.settimeout(PAIR_TIMEOUT)
 
-    def _closed(self):
+    def _closed(self, reason=""):
         """The error for the TV hanging up, which before pairing has a likely cause."""
         if self.key:
-            return LgError("the TV closed the connection")
+            return super()._closed(reason)
         if self.prompted:
             return LgError("the pairing request was declined on the TV")
         # In standby the TV still accepts connections, then hangs up.
@@ -561,17 +575,18 @@ class Remote:
             self.write("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1016h\x1b[?1016$p")
             self.draw()
             while True:
-                if self.tv.waiting():
-                    self.from_tv(self.tv.message())
-                    continue
-                if self.pointer.waiting():
-                    self.pointer.receive()
-                    continue
-                ready = select.select([fd, self.tv.sock, self.pointer.sock], [], [])[0]
+                # Read one frame at a time from whichever side has data, so that
+                # a ping from the TV never holds up the keyboard and mouse.
+                if self.tv.waiting() or self.pointer.waiting():
+                    ready = [ws.sock for ws in (self.tv, self.pointer) if ws.waiting()]
+                else:
+                    ready = select.select([fd, self.tv.sock, self.pointer.sock], [], [])[0]
                 if self.tv.sock in ready:
-                    self.from_tv(self.tv.message())
+                    message = self.tv.read_frame()
+                    if message is not None:
+                        self.from_tv(json.loads(message))
                 if self.pointer.sock in ready:
-                    self.pointer.receive()
+                    self.pointer.read_frame()  # it only ever pings
                 if fd in ready and not self.from_terminal(decoder.decode(os.read(fd, 4096))):
                     return
         except KeyboardInterrupt:
