@@ -6,6 +6,9 @@ talks to the TV directly. Nothing else needs to be installed.
 
 ## Features
 
+- Remote control: use this computer's keyboard to press the TV's remote
+  buttons and type into its text fields, and its mouse to move the TV's
+  pointer, click and scroll
 - Power: turn the TV on (Wake-on-LAN) or off, and turn the screen on or off
 - Volume: up, down, set a level, mute and unmute
 - Media: play, pause, stop, rewind, fast forward
@@ -60,6 +63,7 @@ Or give a command:
 
 | Command | What it does |
 | --- | --- |
+| `lg remote` | Control the TV with this keyboard and mouse (see below) |
 | `lg on` / `lg off` | Turn the TV on or off |
 | `lg screen-on` / `lg screen-off` | Turn the screen on or off; the sound keeps playing |
 | `lg volume` | Show the volume |
@@ -73,9 +77,40 @@ Or give a command:
 | `lg open https://example.com` | Open a page in the TV's browser |
 | `lg open https://youtu.be/...` | Play a video in the YouTube app |
 | `lg notify "Dinner is ready"` | Show a message on the TV |
+| `lg button HOME` | Press a remote control button: `HOME`, `BACK`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `ENTER`, `MENU`, `INFO`, `EXIT`, `0` to `9`, ... |
+| `lg type "hello"` | Type into the text field selected on the TV |
 | `lg help` | List the commands |
 
 To force the menu tool, set `LG_UI=dialog` or `LG_UI=whiptail`.
+
+### Keyboard and mouse
+
+`lg remote` (or *Remote Control* in the menu) turns the terminal window into
+a remote control until you press `q`:
+
+| Key | On the TV |
+| --- | --- |
+| Arrow keys | Move around |
+| Enter | OK |
+| Backspace or Esc | Back |
+| `h` or Home | Home screen |
+| `+` and `-` | Volume |
+| `m` | Mute |
+| `p` / space | Play / pause |
+| `0` to `9` | Number keys |
+| Tab | Start or stop typing into the TV |
+| `q` | Quit (Ctrl+C also quits while typing) |
+
+When a text field on the TV is selected and its on-screen keyboard opens,
+`lg` starts typing into it by itself: letters, numbers, symbols and other
+scripts such as Persian go straight into the field, Backspace deletes and
+Enter submits. Tab or Esc stops typing, so the letter keys work as shortcuts
+again.
+
+Moving the mouse over the window moves the TV's pointer: crossing the window
+crosses the TV's screen. Click to click, right-click to go back, and use the
+wheel to scroll. Terminals that report the mouse in pixels (`lg` asks) give
+smoother movement than ones that report it in character cells.
 
 ## How it works
 
@@ -83,7 +118,10 @@ The TV accepts commands on a websocket at port 3001, over TLS with a
 self-signed certificate, the same API that phone remote apps use.
 Before it obeys a client, the TV shows a pairing prompt, and it then gives the
 client a key to use from then on. `lg` writes the small websocket client it
-needs itself, so it has no dependencies. Turning the TV on is the exception:
+needs itself, so it has no dependencies. Remote control buttons and pointer
+movements go through a second websocket that the TV opens on request, and
+typed text goes to the TV's input method, which also tells `lg` when its
+keyboard opens and closes. Turning the TV on is the exception:
 the API is not running then, so `lg on` sends a Wake-on-LAN packet to the
 TV's hardware address, which is saved when you pair.
 
@@ -106,6 +144,13 @@ detected`. `lg` sends the manifest unsigned, which the TV accepts.
   Turn the TV on, or run `lg setup IP`.
 - **No pairing prompt appears**: the screen must be on. Run `lg setup`
   again while the TV is on.
+- **"no text field is selected on the TV"**, or typing does nothing: select
+  a text field on the TV first, so that its on-screen keyboard opens. If an
+  app draws its own keyboard instead of the TV's, typed text may not reach
+  it; use the arrow keys and Enter on that keyboard instead.
+- **The mouse does nothing in `lg remote`**: the terminal must report mouse
+  events. GNOME Terminal, Ptyxis, Konsole, xterm, kitty and most others do;
+  inside tmux, turn on `set -g mouse on`.
 
 ## Moving from the `lgtv` version
 

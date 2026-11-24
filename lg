@@ -3,6 +3,7 @@
 
 Usage:
   lg                     open the menu
+  lg remote              control the TV with this computer's keyboard and mouse
   lg setup [IP]          find the TV on the network (or use IP) and pair with it
   lg on | off            turn the TV on (Wake-on-LAN) or off
   lg screen-on | screen-off
@@ -13,6 +14,8 @@ Usage:
   lg app [ID]            list the apps, or start one
   lg open URL            open a web page (YouTube links open in the YouTube app)
   lg notify TEXT         show a message on the TV
+  lg button NAME         press a remote control button: HOME, BACK, UP, ENTER, ...
+  lg type TEXT           type into the text field selected on the TV
 
 lg needs only Python 3, plus whiptail or dialog for the menu. It talks to the
 TV through the TV's own websocket API and keeps the pairing in
@@ -20,15 +23,21 @@ TV through the TV's own websocket API and keeps the pairing in
 """
 
 import base64
+import codecs
+import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
+import termios
 import time
+import tty
 from urllib.parse import unquote, urlparse
 
 PORT = 3001         # the TV's websocket API (TLS)
@@ -42,9 +51,10 @@ TITLE = "LG TV Remote Control"
 # these in a manifest signed with an old LG test certificate, which recent LG
 # firmware rejects ("403 Pairing rejected: blacklisted certificate detected").
 # Sent unsigned, the TV still shows the pairing prompt and grants them, as long
-# as each one is listed here (READ_INSTALLED_APPS is the one that lists apps).
+# as each one is listed here (READ_INSTALLED_APPS lists apps, CONTROL_INPUT_TEXT
+# types text, CONTROL_MOUSE_AND_KEYBOARD opens the pointer socket).
 PERMISSIONS = """
-    READ_INSTALLED_APPS
+    READ_INSTALLED_APPS CONTROL_INPUT_TEXT CONTROL_MOUSE_AND_KEYBOARD
     LAUNCH LAUNCH_WEBAPP APP_TO_APP CLOSE TEST_OPEN TEST_PROTECTED CONTROL_AUDIO
     CONTROL_DISPLAY CONTROL_INPUT_JOYSTICK CONTROL_INPUT_MEDIA_RECORDING
     CONTROL_INPUT_MEDIA_PLAYBACK CONTROL_INPUT_TV CONTROL_POWER READ_APP_STATUS
@@ -76,39 +86,37 @@ SIMPLE = {
     "rewind": ("media.controls/rewind", None, "Rewinding."),
     "forward": ("media.controls/fastForward", None, "Fast-forwarding."),
 }
-COMMANDS = set(SIMPLE) | {"on", "volume", "input", "app", "open", "notify"}
+COMMANDS = set(SIMPLE) | {"on", "volume", "input", "app", "open", "notify", "button", "type"}
 
 
 class LgError(Exception):
     """A problem to tell the user about, without a traceback."""
 
 
+class NoAnswer(LgError):
+    """The TV did not answer in time."""
+
+
 # ------------------------------- the TV's API ------------------------------ #
 
-class TV:
-    """A connection to the TV's websocket API (SSAP), paired on connecting.
+class WebSocket:
+    """A websocket client: the little lg needs of one (text messages, client
+    side, no extensions), since Python has none built in."""
 
-    Python has no websocket client built in; the little lg needs of one
-    (text messages, client side, no extensions) is written out here.
-    """
-
-    def __init__(self, ip, key=None):
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE  # the TV's certificate is self-signed
+    def __init__(self, host, port, path="/", secure=True):
         try:
-            raw = socket.create_connection((ip, PORT), timeout=TIMEOUT)
-            self.sock = context.wrap_socket(raw, server_hostname=ip)
+            sock = socket.create_connection((host, port), timeout=TIMEOUT)
+            if secure:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE  # the TV's certificate is self-signed
+                sock = context.wrap_socket(sock, server_hostname=host)
         except OSError as e:
-            raise LgError(f"cannot reach the TV at {ip} ({e.strerror or e}). "
+            raise LgError(f"cannot reach the TV at {host} ({e.strerror or e}). "
                           "Is it plugged in and on this network?") from None
-        self.file = self.sock.makefile("rb")
-        self.count = 0
-        self.key = None
-        self.prompted = False
+        self.sock, self.buffer = sock, b""
         try:
-            self._upgrade(ip)
-            self.key = self._register(key)
+            self._upgrade(f"{host}:{port}", path)
         except BaseException:
             self.close()
             raise
@@ -122,38 +130,130 @@ class TV:
     def close(self):
         try:
             self._send_frame(0x8, b"\x03\xe8")  # close, "normal closure"
-            self.sock.close()
         except OSError:
             pass
+        self.sock.close()
 
-    def request(self, uri, payload=None):
-        """Call ssap://URI on the TV and return the reply's payload."""
-        self.count += 1
-        message = {"type": "request", "id": str(self.count), "uri": "ssap://" + uri}
-        if payload is not None:
-            message["payload"] = payload
-        self._send(message)
+    def waiting(self):
+        """Whether data from the TV has arrived but not been read yet."""
+        return bool(self.buffer) or (isinstance(self.sock, ssl.SSLSocket)
+                                     and self.sock.pending() > 0)
+
+    def send(self, text):
+        self._send_frame(0x1, text.encode())
+
+    def receive(self):
+        """Wait for the next text message."""
+        message = b""
         while True:
-            reply = self._receive()
-            if reply.get("id") != message["id"]:
-                continue
-            result = reply.get("payload") or {}
-            if reply.get("type") == "error" or result.get("returnValue") is False:
-                raise LgError("the TV refused: " + (result.get("errorText")
-                                                    or reply.get("error") or "no reason given"))
-            return result
+            first, second = self._read(2)
+            opcode, size = first & 0x0F, second & 0x7F
+            if size >= 126:
+                size = int.from_bytes(self._read(2 if size == 126 else 8), "big")
+            mask = self._read(4) if second & 0x80 else b""
+            data = self._read(size)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                raise self._closed()
+            if opcode == 0x9:
+                self._send_frame(0xA, data)  # answer a ping
+            elif opcode in (0x0, 0x1):
+                message += data
+                if first & 0x80:
+                    return message.decode(errors="replace")
 
-    def _upgrade(self, ip):
+    def _closed(self):
+        return LgError("the TV closed the connection")
+
+    def _upgrade(self, host, path):
         nonce = base64.b64encode(os.urandom(16)).decode()
-        self.sock.sendall((f"GET / HTTP/1.1\r\nHost: {ip}:{PORT}\r\n"
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
                            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                            f"Sec-WebSocket-Key: {nonce}\r\nSec-WebSocket-Version: 13\r\n\r\n"
                            ).encode())
-        status = self.file.readline().decode(errors="replace").strip()
-        while self.file.readline() not in (b"\r\n", b""):
-            pass
+        while b"\r\n\r\n" not in self.buffer:
+            self._fill()
+        head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode(errors="replace")
         if " 101 " not in status + " ":
-            raise LgError(f"the TV did not accept the connection ({status or 'no answer'})")
+            raise LgError(f"the TV did not accept the connection ({status})")
+
+    def _send_frame(self, opcode, data):
+        size = len(data)
+        if size < 126:
+            header = bytes([0x80 | opcode, 0x80 | size])
+        elif size < 1 << 16:
+            header = bytes([0x80 | opcode, 0x80 | 126]) + size.to_bytes(2, "big")
+        else:
+            header = bytes([0x80 | opcode, 0x80 | 127]) + size.to_bytes(8, "big")
+        mask = os.urandom(4)  # clients must mask what they send
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _fill(self):
+        try:
+            data = self.sock.recv(65536)
+        except TimeoutError:
+            raise NoAnswer("the TV stopped answering") from None
+        except OSError as e:
+            raise LgError(f"lost the connection to the TV ({e.strerror or e})") from None
+        if not data:
+            raise self._closed()
+        self.buffer += data
+
+    def _read(self, size):
+        while len(self.buffer) < size:
+            self._fill()
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+
+class TV(WebSocket):
+    """The TV's command API (SSAP), paired on connecting."""
+
+    def __init__(self, ip, key=None):
+        self.key, self.prompted, self.count = None, False, 0
+        super().__init__(ip, PORT)
+        try:
+            self.key = self._register(key)
+        except BaseException:
+            self.close()
+            raise
+
+    def message(self):
+        return json.loads(self.receive())
+
+    def send_request(self, uri, payload=None, kind="request"):
+        """Send a request (or a subscription) without waiting; returns its id."""
+        self.count += 1
+        message = {"type": kind, "id": str(self.count), "uri": "ssap://" + uri}
+        if payload is not None:
+            message["payload"] = payload
+        self.send(json.dumps(message))
+        return message["id"]
+
+    def request(self, uri, payload=None):
+        """Call ssap://URI on the TV and return the reply's payload."""
+        id = self.send_request(uri, payload)
+        while True:
+            reply = self.message()
+            if reply.get("id") == id:
+                return self.result(reply)
+
+    @staticmethod
+    def result(reply):
+        result = reply.get("payload") or {}
+        if reply.get("type") == "error" or result.get("returnValue") is False:
+            raise LgError("the TV refused: " + (result.get("errorText")
+                                                or reply.get("error") or "no reason given"))
+        return result
+
+    def pointer(self):
+        """Open the socket that takes remote control buttons and pointer moves."""
+        path = self.request("com.webos.service.networkinput/getPointerInputSocket")
+        url = urlparse(path["socketPath"])
+        secure = url.scheme == "wss"
+        return Pointer(url.hostname, url.port or (3001 if secure else 3000), url.path, secure)
 
     def _register(self, key):
         payload = {"forcePairing": False, "pairingType": "PROMPT",
@@ -161,9 +261,9 @@ class TV:
                                 "permissions": PERMISSIONS}}
         if key:
             payload["client-key"] = key
-        self._send({"type": "register", "id": "register", "payload": payload})
+        self.send(json.dumps({"type": "register", "id": "register", "payload": payload}))
         while True:
-            reply = self._receive()
+            reply = self.message()
             if reply.get("type") == "registered":
                 self.sock.settimeout(TIMEOUT)
                 return reply["payload"]["client-key"]
@@ -184,51 +284,21 @@ class TV:
         # In standby the TV still accepts connections, then hangs up.
         return LgError('the TV is off or still starting up. Turn it on with "lg on".')
 
-    def _send(self, message):
-        self._send_frame(0x1, json.dumps(message).encode())
 
-    def _send_frame(self, opcode, data):
-        size = len(data)
-        if size < 126:
-            header = bytes([0x80 | opcode, 0x80 | size])
-        elif size < 1 << 16:
-            header = bytes([0x80 | opcode, 0x80 | 126]) + size.to_bytes(2, "big")
-        else:
-            header = bytes([0x80 | opcode, 0x80 | 127]) + size.to_bytes(8, "big")
-        mask = os.urandom(4)  # clients must mask what they send
-        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+class Pointer(WebSocket):
+    """The TV's pointer socket: remote control buttons and the on-screen pointer."""
 
-    def _receive(self):
-        """Read the next message from the TV as JSON."""
-        message = b""
-        while True:
-            first, second = self._read(2)
-            opcode, size = first & 0x0F, second & 0x7F
-            if size >= 126:
-                size = int.from_bytes(self._read(2 if size == 126 else 8), "big")
-            mask = self._read(4) if second & 0x80 else b""
-            data = self._read(size)
-            if mask:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-            if opcode == 0x8:
-                raise self._closed()
-            if opcode == 0x9:
-                self._send_frame(0xA, data)  # answer a ping
-            elif opcode in (0x0, 0x1):
-                message += data
-                if first & 0x80:
-                    return json.loads(message)
+    def button(self, name):
+        self.send(f"type:button\nname:{name}\n\n")
 
-    def _read(self, size):
-        try:
-            data = self.file.read(size)
-        except TimeoutError:
-            raise LgError("the TV stopped answering") from None
-        except OSError as e:
-            raise LgError(f"lost the connection to the TV ({e.strerror or e})") from None
-        if len(data) < size:
-            raise self._closed()
-        return data
+    def move(self, dx, dy):
+        self.send(f"type:move\ndx:{dx}\ndy:{dy}\ndown:0\n\n")
+
+    def click(self):
+        self.send("type:click\n\n")
+
+    def scroll(self, dy):
+        self.send(f"type:scroll\ndx:0\ndy:{dy}\n\n")
 
 
 def list_inputs(tv):
@@ -357,8 +427,10 @@ def execute(config, command, arg=""):
     """Run one of the commands in the usage above; returns what to tell the user."""
     if command not in COMMANDS:
         raise LgError(f'unknown command "{command}" (see "lg help")')
-    if command in ("open", "notify") and not arg:
-        raise LgError(f"{command} needs {'an address' if command == 'open' else 'a message'}")
+    needs = {"open": "an address", "notify": "a message", "type": "some text",
+             "button": "a button name, such as HOME, BACK, UP or ENTER"}
+    if command in needs and not arg:
+        raise LgError(f"{command} needs {needs[command]}")
     if command == "volume" and arg not in ("", "up", "down") and not (
             arg.isdigit() and int(arg) <= 100):
         raise LgError("the volume is a number from 0 to 100, up or down")
@@ -399,6 +471,18 @@ def execute(config, command, arg=""):
         if command == "notify":
             tv.request("system.notifications/createToast", {"message": arg})
             return "Message shown on the TV."
+        if command == "button":
+            with tv.pointer() as pointer:
+                pointer.button(arg.upper())
+            return f"Pressed {arg.upper()}."
+        if command == "type":
+            # The TV only answers once a text field has taken the text.
+            tv.sock.settimeout(3)
+            try:
+                tv.request("com.webos.service.ime/insertText", {"text": arg, "replace": False})
+            except NoAnswer:
+                raise LgError("no text field is selected on the TV") from None
+            return "Typed."
 
 
 def setup_command(config, args):
@@ -415,6 +499,202 @@ def setup_command(config, args):
         asleep = not awake
         print(f"Found {name} at {ip}.", file=sys.stderr)
     return pair(config, ip, asleep)
+
+
+# -------------------------- keyboard and mouse ----------------------------- #
+
+# Keys in the remote, and the TV remote control button each one presses.
+KEYS = {
+    "\x1b[A": "UP", "\x1bOA": "UP", "\x1b[B": "DOWN", "\x1bOB": "DOWN",
+    "\x1b[C": "RIGHT", "\x1bOC": "RIGHT", "\x1b[D": "LEFT", "\x1bOD": "LEFT",
+    "\n": "ENTER", "\r": "ENTER", "\x7f": "BACK", "\x08": "BACK", "\x1b": "BACK",
+    "\x1b[H": "HOME", "\x1bOH": "HOME", "\x1b[1~": "HOME", "h": "HOME",
+    "+": "VOLUMEUP", "=": "VOLUMEUP", "-": "VOLUMEDOWN", "m": "MUTE",
+    "p": "PLAY", " ": "PAUSE", **{digit: digit for digit in "0123456789"},
+}
+REMOTE_HELP = """
+  LG TV remote: this keyboard and mouse now control the TV.
+
+  Arrow keys   move around               Enter        OK
+  Backspace    back                      Esc          back
+  h or Home    home screen               m            mute
+  + and -      volume                    p / space    play / pause
+  0 to 9       number keys               q            quit
+
+  Tab          type into the TV. This starts by itself when the TV's
+               keyboard opens; Tab, Esc or Enter stops it. While typing,
+               Ctrl+C quits.
+
+  Mouse        move it over this window to move the TV's pointer.
+               Click to click, right-click to go back, scroll to scroll.
+"""
+TV_WIDTH, TV_HEIGHT = 1920, 1080  # crossing this window crosses the TV's screen
+
+
+class Remote:
+    """Turns the terminal's keys and mouse events into input for the TV."""
+
+    TOKENS = re.compile(r"\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[[0-9;?$]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|.",
+                        re.S)
+    MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+
+    def __init__(self, tv, pointer):
+        self.tv, self.pointer = tv, pointer
+        self.typing = False
+        self.keyboard = None   # id of the subscription to the TV's keyboard
+        self.tv_typing = None  # whether the TV's keyboard is open, as it last said
+        self.mouse = None      # where the mouse was in the window
+        self.pixels = False    # whether the terminal reports the mouse in pixels
+        self.moved = [0, 0]    # pointer movement not sent yet
+        self.note = "Ready."
+
+    def run(self):
+        self.keyboard = self.tv.send_request("com.webos.service.ime/registerRemoteKeyboard",
+                                             kind="subscribe")
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            tty.setcbreak(fd)
+            # Alternate screen, no cursor, every mouse event in SGR format, in
+            # pixels where the terminal can (and ask whether it can).
+            self.write("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1016h\x1b[?1016$p")
+            self.draw()
+            while True:
+                if self.tv.waiting():
+                    self.from_tv(self.tv.message())
+                    continue
+                if self.pointer.waiting():
+                    self.pointer.receive()
+                    continue
+                ready = select.select([fd, self.tv.sock, self.pointer.sock], [], [])[0]
+                if self.tv.sock in ready:
+                    self.from_tv(self.tv.message())
+                if self.pointer.sock in ready:
+                    self.pointer.receive()
+                if fd in ready and not self.from_terminal(decoder.decode(os.read(fd, 4096))):
+                    return
+        except KeyboardInterrupt:
+            return
+        finally:
+            self.write("\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l")
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    def from_terminal(self, text):
+        """Act on what the terminal sent; returns False to quit."""
+        typed = ""
+        for token in self.TOKENS.findall(text):
+            if self.typing and len(token) == 1 and token.isprintable():
+                typed += token
+                continue
+            if typed:
+                self.type(typed)
+                typed = ""
+            mouse = self.MOUSE.fullmatch(token)
+            if mouse:
+                self.from_mouse(int(mouse[1]), int(mouse[2]), int(mouse[3]), mouse[4] == "M")
+                continue
+            self.send_moves()
+            if token.startswith("\x1b[?1016;"):  # the answer about pixels: 1 or 3 is yes
+                self.pixels = token[8:9] in ("1", "3")
+            elif token == "\t":
+                self.set_typing(not self.typing)
+            elif self.typing and token == "\x1b":
+                self.set_typing(False)
+            elif self.typing and token in ("\x7f", "\x08"):
+                self.tv.send_request("com.webos.service.ime/deleteCharacters", {"count": 1})
+                self.show("Deleted a character.")
+            elif self.typing and token in ("\n", "\r"):
+                self.tv.send_request("com.webos.service.ime/sendEnterKey")
+                self.set_typing(False, "Sent Enter.")
+            elif token == "q" and not self.typing:
+                return False
+            elif token in KEYS:
+                self.pointer.button(KEYS[token])
+                self.show(f"Pressed {KEYS[token]}.")
+        if typed:
+            self.type(typed)
+        self.send_moves()
+        return True
+
+    def from_mouse(self, code, x, y, pressed):
+        width, height, columns, rows = self.window()
+        if not self.pixels and (x > columns + 1 or y > rows + 1):
+            self.pixels, self.mouse = True, None  # it reports pixels without saying so
+        if not self.pixels:
+            width, height = columns, rows
+        if code & 64:  # the wheel: 64 is up, 65 down
+            self.send_moves()
+            self.pointer.scroll(1 if code & 1 else -1)
+        elif code & 32:  # the mouse moved
+            if self.mouse:
+                self.moved[0] += (x - self.mouse[0]) * TV_WIDTH / width
+                self.moved[1] += (y - self.mouse[1]) * TV_HEIGHT / height
+        elif pressed:
+            self.send_moves()
+            button = code & 3
+            if button == 0:
+                self.pointer.click()
+                self.show("Clicked.")
+            elif button == 2:
+                self.pointer.button("BACK")
+                self.show("Pressed BACK.")
+        self.mouse = (x, y)
+
+    def send_moves(self):
+        dx, dy = round(self.moved[0]), round(self.moved[1])
+        if dx or dy:
+            self.pointer.move(dx, dy)
+            self.moved = [self.moved[0] - dx, self.moved[1] - dy]
+
+    def type(self, text):
+        self.tv.send_request("com.webos.service.ime/insertText", {"text": text, "replace": False})
+        self.show(f"Typed: {text}")
+
+    def from_tv(self, message):
+        if message.get("id") == self.keyboard:
+            # The TV reports on its keyboard often; follow it only when it opens
+            # or closes, so that Tab and Esc can override it in between.
+            widget = (message.get("payload") or {}).get("currentWidget") or {}
+            if "focus" in widget and bool(widget["focus"]) != self.tv_typing:
+                self.tv_typing = bool(widget["focus"])
+                self.set_typing(self.tv_typing, "The TV's keyboard opened."
+                                if self.tv_typing else "The TV's keyboard closed.")
+        elif message.get("type") == "error":
+            self.show("The TV refused: " + str(message.get("error")))
+
+    def set_typing(self, on, note=None):
+        self.typing = on
+        self.show(note or ("Typing into the TV." if on else "Stopped typing."))
+
+    def window(self):
+        """The terminal's size: width and height in pixels, then columns and rows."""
+        rows, columns, width, height = struct.unpack(
+            "HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+        return width or columns * 10, height or rows * 20, columns, rows
+
+    def draw(self):
+        self.write("\x1b[2J\x1b[H" + REMOTE_HELP.replace("\n", "\r\n"))
+        self.show(self.note)
+
+    def show(self, note):
+        self.note = note
+        mode = "TYPING (Tab or Esc to stop)" if self.typing else "remote"
+        rows = self.window()[3]
+        self.write(f"\x1b[{rows};1H\x1b[2K  [{mode}]  {note}"[:400])
+
+    @staticmethod
+    def write(text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+def remote(config):
+    """Control the TV with this computer's keyboard and mouse, until q is pressed."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise LgError("the remote needs a terminal")
+    with connect(config) as tv, tv.pointer() as pointer:
+        Remote(tv, pointer).run()
 
 
 # -------------------------------- the menu --------------------------------- #
@@ -541,16 +821,17 @@ def interactive(config):
         return attempt(lambda: pair(config, ip, asleep))
 
     actions = {
-        "1": ("Power", lambda: submenu("Power", POWER)),
-        "2": ("Volume", lambda: submenu("Volume", VOLUME)),
-        "3": ("Media", lambda: submenu("Media", MEDIA)),
-        "4": ("Inputs", lambda: choose("input", "Inputs")),
-        "5": ("Apps", lambda: choose("app", "Apps")),
-        "6": ("Open URL", lambda: type_in(
+        "1": ("Remote Control (keyboard and mouse)", lambda: attempt(lambda: remote(config))),
+        "2": ("Power", lambda: submenu("Power", POWER)),
+        "3": ("Volume", lambda: submenu("Volume", VOLUME)),
+        "4": ("Media", lambda: submenu("Media", MEDIA)),
+        "5": ("Inputs", lambda: choose("input", "Inputs")),
+        "6": ("Apps", lambda: choose("app", "Apps")),
+        "7": ("Open URL", lambda: type_in(
             "open", "Open URL", "Address to open (YouTube links open in the YouTube app):")),
-        "7": ("Send Message", lambda: type_in(
+        "8": ("Send Message", lambda: type_in(
             "notify", "Send Message", "Message to show on the TV:")),
-        "8": ("Set Up TV", setup),
+        "9": ("Set Up TV", setup),
     }
 
     if not config.get("ip") and ui.confirm(
@@ -576,6 +857,8 @@ def main(args):
             print(__doc__.strip())
         elif args[0] == "setup":
             print(setup_command(config, args[1:]))
+        elif args[0] == "remote":
+            remote(config)
         else:
             print(execute(config, args[0], " ".join(args[1:])))
     except LgError as e:
