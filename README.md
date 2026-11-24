@@ -4,6 +4,8 @@
 commands. It is a single Python file that uses only the standard library and
 talks to the TV directly. Nothing else needs to be installed.
 
+![The menu that lg opens in a terminal](docs/menu.png)
+
 ## Features
 
 - Remote control: use this computer's keyboard to press the TV's remote
@@ -132,10 +134,10 @@ keyboard opens and closes. Turning the TV on is the exception:
 the API is not running then, so `lg on` sends a Wake-on-LAN packet to the
 TV's hardware address, which is saved when you pair.
 
-When pairing, clients send a manifest listing the permissions they want. Most
-open-source clients sign it with an old LG test certificate, and recent LG
-firmware rejects that with `403 Pairing rejected: blacklisted certificate
-detected`. `lg` sends the manifest unsigned, which the TV accepts.
+When pairing, `lg` sends the TV a manifest listing the permissions it wants.
+It sends it unsigned, because recent LG firmware rejects the signed manifest
+that other clients send (`403 Pairing rejected: blacklisted certificate
+detected`).
 
 ## Troubleshooting
 
@@ -160,13 +162,6 @@ detected`. `lg` sends the manifest unsigned, which the TV accepts.
 - **The mouse does nothing in `lg remote`**: the terminal must report mouse
   events. GNOME Terminal, Ptyxis, Konsole, xterm, kitty and most others do;
   inside tmux, turn on `set -g mouse on`.
-
-## Moving from the `lgtv` version
-
-Earlier versions of this script drove the TV through `lgtv` from
-[LGWebOSRemote](https://github.com/klattimer/LGWebOSRemote), and needed
-`dialog` and `jq`. None of these are needed any more. Remove `lgtv` with
-`pipx uninstall lgtv`, then run `lg setup` once.
 
 ## License
 
